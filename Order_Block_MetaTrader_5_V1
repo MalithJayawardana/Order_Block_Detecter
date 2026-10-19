@@ -1,0 +1,307 @@
+#property copyright "Order Block Pro"
+#property version   "1.00"
+#property strict
+#property indicator_chart_window
+#property indicator_buffers 0
+#property indicator_plots   0
+
+enum ENUM_MIT { MIT_CLOSE = 0, MIT_WICK = 1 };
+
+input group "Detection"
+input int      InpPivotLen   = 10;
+input int      InpLookback   = 100;
+input int      InpSweepLen   = 20;
+input double   InpDispMult   = 1.5;
+input int      InpMinScore   = 1;
+
+input group "Management"
+input int      InpMaxOB      = 250;
+input ENUM_MIT InpMitMode    = MIT_CLOSE;
+input bool     InpShowMit    = true;
+input int      InpMaxObjects = 500;
+
+input group "Visuals"
+input color    InpBullClr    = C'8,153,129';
+input color    InpBearClr    = C'242,54,69';
+input bool     InpShowBos    = true;
+input bool     InpShowText   = true;
+
+input group "Alerts"
+input bool     InpAlert      = true;
+
+struct OBX
+  {
+   string   name;
+   bool     bull;
+   bool     active;
+   double   top;
+   double   bot;
+   datetime t0;
+   datetime t1;
+   int      score;
+   string   tag;
+  };
+
+OBX     g_obs[];
+double  g_atr[];
+int     g_done = -1;
+bool    g_hasHi = false, g_hasLo = false;
+double  g_hiP = 0, g_loP = 0;
+int     g_hiI = -1, g_loI = -1;
+
+void ResetState()
+  {
+   ObjectsDeleteAll(0, "OBP_");
+   ArrayResize(g_obs, 0);
+   g_done = -1;
+   g_hasHi = false; g_hasLo = false;
+   g_hiI = -1; g_loI = -1;
+  }
+
+int OnInit()
+  {
+   ResetState();
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   ObjectsDeleteAll(0, "OBP_");
+  }
+
+void DelObjs(string name)
+  {
+   ObjectDelete(0, name);
+   ObjectDelete(0, name + "_t");
+  }
+
+void RemoveAt(int idx)
+  {
+   DelObjs(g_obs[idx].name);
+   int n = ArraySize(g_obs);
+   for(int i = idx; i < n - 1; i++) g_obs[i] = g_obs[i + 1];
+   ArrayResize(g_obs, n - 1);
+  }
+
+void DrawOB(OBX &o)
+  {
+   color base = o.bull ? InpBullClr : InpBearClr;
+   int alpha = (o.score >= 4) ? 80 : ((o.score == 3) ? 55 : 35);
+   if(!o.active) { base = clrGray; alpha = 30; }
+
+   if(ObjectFind(0, o.name) < 0)
+     {
+      ObjectCreate(0, o.name, OBJ_RECTANGLE, 0, o.t0, o.top, o.t1, o.bot);
+      ObjectSetInteger(0, o.name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, o.name, OBJPROP_BACK, true);
+      ObjectSetInteger(0, o.name, OBJPROP_SELECTABLE, false);
+      ObjectSetString(0, o.name, OBJPROP_TOOLTIP,
+                      (o.bull ? "Bull OB " : "Bear OB ") + IntegerToString(o.score) + "/4 " + o.tag);
+     }
+   ObjectSetInteger(0, o.name, OBJPROP_TIME, 0, o.t0);
+   ObjectSetInteger(0, o.name, OBJPROP_TIME, 1, o.t1);
+   ObjectSetDouble(0, o.name, OBJPROP_PRICE, 0, o.top);
+   ObjectSetDouble(0, o.name, OBJPROP_PRICE, 1, o.bot);
+   ObjectSetInteger(0, o.name, OBJPROP_COLOR, ColorToARGB(base, alpha));
+
+   if(InpShowText)
+     {
+      string tn = o.name + "_t";
+      if(ObjectFind(0, tn) < 0)
+        {
+         ObjectCreate(0, tn, OBJ_TEXT, 0, o.t0, o.top);
+         ObjectSetInteger(0, tn, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+         ObjectSetInteger(0, tn, OBJPROP_FONTSIZE, 7);
+         ObjectSetInteger(0, tn, OBJPROP_SELECTABLE, false);
+         ObjectSetString(0, tn, OBJPROP_TEXT, "OB " + IntegerToString(o.score) + "/4 " + o.tag);
+        }
+      ObjectSetInteger(0, tn, OBJPROP_COLOR, o.active ? base : clrGray);
+     }
+  }
+
+void Calc(bool isBull, int startI, int i,
+          const double &open[], const double &high[], const double &low[], const double &close[],
+          int &mo, bool &sw, bool &dp, bool &fv)
+  {
+   int off = MathMin(i - startI, InpLookback);
+   if(off < 0) off = 0;
+   mo = 0;
+   double ext = isBull ? low[i] : high[i];
+   for(int o = 0; o <= off; o++)
+     {
+      int idx = i - o;
+      double v = isBull ? low[idx] : high[idx];
+      if((isBull && v < ext) || (!isBull && v > ext)) { ext = v; mo = o; }
+     }
+
+   bool found = false;
+   double ref = isBull ? DBL_MAX : -DBL_MAX;
+   for(int k = mo + 1; k <= mo + InpSweepLen; k++)
+     {
+      int idx = i - k;
+      if(idx < 0) break;
+      found = true;
+      double v = isBull ? low[idx] : high[idx];
+      ref = isBull ? MathMin(ref, v) : MathMax(ref, v);
+     }
+   int mi = i - mo;
+   sw = found && (isBull ? (low[mi] < ref) : (high[mi] > ref));
+
+   dp = false; fv = false;
+   for(int j = 0; j <= mo - 1; j++)
+      if(MathAbs(close[i - j] - open[i - j]) >= g_atr[i] * InpDispMult) dp = true;
+   for(int j = 0; j <= mo - 2; j++)
+     {
+      int a = i - j, b = i - j - 2;
+      if(b < 0) break;
+      if(isBull  && low[a]  > high[b]) fv = true;
+      if(!isBull && high[a] < low[b])  fv = true;
+     }
+  }
+
+void AddOB(bool bull, int i, int mo, int sc, string tag,
+           const datetime &time[], const double &high[], const double &low[], bool live)
+  {
+   OBX o;
+   o.bull = bull;
+   o.active = true;
+   o.top = high[i - mo];
+   o.bot = low[i - mo];
+   o.t0 = time[i - mo];
+   o.t1 = time[i];
+   o.score = sc;
+   o.tag = tag;
+   o.name = "OBP_" + IntegerToString((long)time[i]) + (bull ? "B" : "S");
+
+   int n = ArraySize(g_obs);
+   ArrayResize(g_obs, n + 1);
+   g_obs[n] = o;
+
+   int cnt = 0, oldest = -1;
+   for(int k = 0; k < ArraySize(g_obs); k++)
+      if(g_obs[k].bull == bull && g_obs[k].active) { cnt++; if(oldest < 0) oldest = k; }
+   if(cnt > InpMaxOB && oldest >= 0) RemoveAt(oldest);
+
+   while(ArraySize(g_obs) > InpMaxObjects) RemoveAt(0);
+
+   if(live && InpAlert)
+      Alert(_Symbol, " ", EnumToString(_Period), (bull ? " Bullish" : " Bearish"),
+            " OB ", sc, "/4 [", tag, "] ", DoubleToString(o.bot, _Digits), " - ", DoubleToString(o.top, _Digits));
+  }
+
+void ManageOBs(int i, const datetime &time[], const double &high[], const double &low[], const double &close[])
+  {
+   for(int k = ArraySize(g_obs) - 1; k >= 0; k--)
+     {
+      if(!g_obs[k].active) continue;
+      bool bull = g_obs[k].bull;
+      double src = (InpMitMode == MIT_WICK) ? (bull ? low[i] : high[i]) : close[i];
+      bool broken = bull ? (src < g_obs[k].bot) : (src > g_obs[k].top);
+      if(broken)
+        {
+         if(InpShowMit)
+           {
+            g_obs[k].active = false;
+            g_obs[k].t1 = time[i];
+            DrawOB(g_obs[k]);
+           }
+         else
+            RemoveAt(k);
+        }
+      else
+         g_obs[k].t1 = time[i];
+     }
+  }
+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   int minBars = 2 * InpPivotLen + 5;
+   if(rates_total < minBars) return 0;
+
+   if(prev_calculated == 0) ResetState();
+   if(ArraySize(g_atr) < rates_total) ArrayResize(g_atr, rates_total);
+
+   int start = g_done + 1;
+   int last = rates_total - 2;
+   bool live = (prev_calculated > 0);
+
+   for(int i = start; i <= last; i++)
+     {
+      double tr = high[i] - low[i];
+      if(i > 0)
+        {
+         tr = MathMax(tr, MathMax(MathAbs(high[i] - close[i - 1]), MathAbs(low[i] - close[i - 1])));
+         g_atr[i] = (g_atr[i - 1] * 13.0 + tr) / 14.0;
+        }
+      else
+         g_atr[i] = tr;
+
+      int c = i - InpPivotLen;
+      if(c >= InpPivotLen)
+        {
+         bool isH = true, isL = true;
+         for(int k = 1; k <= InpPivotLen; k++)
+           {
+            if(high[c] <= high[c + k] || high[c] < high[c - k]) isH = false;
+            if(low[c]  >= low[c + k]  || low[c]  > low[c - k])  isL = false;
+           }
+         if(isH) { g_hiP = high[c]; g_hiI = c; g_hasHi = true; }
+         if(isL) { g_loP = low[c];  g_loI = c; g_hasLo = true; }
+        }
+
+      if(g_hasHi && close[i] > g_hiP)
+        {
+         int mo; bool sw, dp, fv;
+         Calc(true, g_hiI, i, open, high, low, close, mo, sw, dp, fv);
+         int sc = 1 + (sw ? 1 : 0) + (dp ? 1 : 0) + (fv ? 1 : 0);
+         string tag = (sw ? "S" : "-") + (dp ? "D" : "-") + (fv ? "F" : "-");
+         if(InpShowBos)
+           {
+            string bn = "OBP_BOS_" + IntegerToString((long)time[i]) + "U";
+            ObjectCreate(0, bn, OBJ_TREND, 0, time[g_hiI], g_hiP, time[i], g_hiP);
+            ObjectSetInteger(0, bn, OBJPROP_COLOR, InpBullClr);
+            ObjectSetInteger(0, bn, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, bn, OBJPROP_SELECTABLE, false);
+           }
+         if(sc >= InpMinScore)
+            AddOB(true, i, mo, sc, tag, time, high, low, live && i == last);
+         g_hasHi = false;
+        }
+
+      if(g_hasLo && close[i] < g_loP)
+        {
+         int mo; bool sw, dp, fv;
+         Calc(false, g_loI, i, open, high, low, close, mo, sw, dp, fv);
+         int sc = 1 + (sw ? 1 : 0) + (dp ? 1 : 0) + (fv ? 1 : 0);
+         string tag = (sw ? "S" : "-") + (dp ? "D" : "-") + (fv ? "F" : "-");
+         if(InpShowBos)
+           {
+            string bn = "OBP_BOS_" + IntegerToString((long)time[i]) + "D";
+            ObjectCreate(0, bn, OBJ_TREND, 0, time[g_loI], g_loP, time[i], g_loP);
+            ObjectSetInteger(0, bn, OBJPROP_COLOR, InpBearClr);
+            ObjectSetInteger(0, bn, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, bn, OBJPROP_SELECTABLE, false);
+           }
+         if(sc >= InpMinScore)
+            AddOB(false, i, mo, sc, tag, time, high, low, live && i == last);
+         g_hasLo = false;
+        }
+
+      ManageOBs(i, time, high, low, close);
+      g_done = i;
+     }
+
+   for(int k = 0; k < ArraySize(g_obs); k++)
+      DrawOB(g_obs[k]);
+   ChartRedraw();
+   return rates_total;
+  }

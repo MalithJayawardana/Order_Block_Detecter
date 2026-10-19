@@ -1,0 +1,137 @@
+//@version=6
+indicator('Order Block Pro', overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 2000)
+
+// ================= INPUTS =================
+gS = 'Detection'
+len       = input.int(10, 'Swing Pivot Length', minval = 2, group = gS)
+lookback  = input.int(100, 'OB Search Lookback (bars)', minval = 10, maxval = 500, group = gS)
+sweepLen  = input.int(20, 'Liquidity Sweep Lookback', minval = 3, maxval = 100, group = gS)
+dispMult  = input.float(1.5, 'Displacement Body (x ATR)', minval = 0.5, step = 0.1, group = gS)
+minScore  = input.int(1, 'Min Score (1-4)', minval = 1, maxval = 4, group = gS)
+
+gM = 'Management'
+maxOB   = input.int(250, 'Max OBs (per side, TV limit 500 total)', minval = 1, maxval = 500, group = gM)
+mitMode = input.string('Close', 'Mitigation Type', options = ['Close', 'Wick'], group = gM)
+showMit = input.bool(true, 'Show Mitigated OBs (grey)', group = gM)
+
+gV = 'Visuals'
+colBull = input.color(#089981, 'Bullish Color', group = gV)
+colBear = input.color(#f23645, 'Bearish Color', group = gV)
+showBos = input.bool(true, 'Show BOS Lines', group = gV)
+
+gA = 'Alerts'
+alertNew = input.bool(true, 'Alert on new OB', group = gA)
+
+// ================= STATE =================
+var float hiP = na
+var int   hiI = na
+var float loP = na
+var int   loI = na
+var obBull = array.new<box>()
+var obBear = array.new<box>()
+
+atrV = ta.atr(14)
+ph = ta.pivothigh(high, len, len)
+pl = ta.pivotlow(low, len, len)
+
+if not na(ph)
+    hiP := ph
+    hiI := bar_index - len
+if not na(pl)
+    loP := pl
+    loI := bar_index - len
+
+// ================= OB CALCULATION =================
+// returns [offset of OB candle, sweep, displacement, fvg]
+f_calc(bool isBull, int startI) =>
+    int off = math.min(bar_index - startI, lookback)
+    int mo = 0
+    float ext = isBull ? low : high
+    for i = 0 to off
+        float v = isBull ? low[i] : high[i]
+        if (isBull and v < ext) or (not isBull and v > ext)
+            ext := v
+            mo := i
+
+    float ref = isBull ? 1e10 : -1e10
+    for k = mo + 1 to mo + sweepLen
+        float v = isBull ? low[k] : high[k]
+        if not na(v)
+            ref := isBull ? math.min(ref, v) : math.max(ref, v)
+    bool sweep = math.abs(ref) < 1e9 and (isBull ? low[mo] < ref : high[mo] > ref)
+
+    bool disp = false
+    bool fvg = false
+    if mo > 0
+        for j = 0 to mo - 1
+            if math.abs(close[j] - open[j]) >= atrV * dispMult
+                disp := true
+    if mo >= 2
+        for j = 0 to mo - 2
+            if isBull and low[j] > high[j + 2]
+                fvg := true
+            if not isBull and high[j] < low[j + 2]
+                fvg := true
+    [mo, sweep, disp, fvg]
+
+f_score(bool sw, bool dp, bool fv) =>
+    1 + (sw ? 1 : 0) + (dp ? 1 : 0) + (fv ? 1 : 0)
+
+f_tag(bool sw, bool dp, bool fv) =>
+    (sw ? 'S' : '-') + (dp ? 'D' : '-') + (fv ? 'F' : '-')
+
+// ================= BOS DETECTION =================
+bool bullBos = barstate.isconfirmed and not na(hiP) and close > hiP
+bool bearBos = barstate.isconfirmed and not na(loP) and close < loP
+
+if bullBos
+    [mo, sw, dp, fv] = f_calc(true, hiI)
+    int sc = f_score(sw, dp, fv)
+    if showBos
+        line.new(hiI, hiP, bar_index, hiP, color = colBull, width = 1)
+    if sc >= minScore
+        transp = sc == 4 ? 70 : sc == 3 ? 80 : 88
+        bx = box.new(bar_index - mo, high[mo], bar_index, low[mo], border_color = color.new(colBull, 40), bgcolor = color.new(colBull, transp), text = 'OB ' + str.tostring(sc) + '/4 ' + f_tag(sw, dp, fv), text_color = colBull, text_size = size.tiny, text_halign = text.align_right)
+        array.push(obBull, bx)
+        if array.size(obBull) > maxOB
+            box.delete(array.shift(obBull))
+        if alertNew
+            alert('Bullish OB ' + str.tostring(sc) + '/4 [' + f_tag(sw, dp, fv) + '] ' + syminfo.ticker + ' (' + timeframe.period + ') zone ' + str.tostring(low[mo], format.mintick) + ' - ' + str.tostring(high[mo], format.mintick), alert.freq_once_per_bar_close)
+    hiP := na
+
+if bearBos
+    [mo, sw, dp, fv] = f_calc(false, loI)
+    int sc = f_score(sw, dp, fv)
+    if showBos
+        line.new(loI, loP, bar_index, loP, color = colBear, width = 1)
+    if sc >= minScore
+        transp = sc == 4 ? 70 : sc == 3 ? 80 : 88
+        bx = box.new(bar_index - mo, high[mo], bar_index, low[mo], border_color = color.new(colBear, 40), bgcolor = color.new(colBear, transp), text = 'OB ' + str.tostring(sc) + '/4 ' + f_tag(sw, dp, fv), text_color = colBear, text_size = size.tiny, text_halign = text.align_right)
+        array.push(obBear, bx)
+        if array.size(obBear) > maxOB
+            box.delete(array.shift(obBear))
+        if alertNew
+            alert('Bearish OB ' + str.tostring(sc) + '/4 [' + f_tag(sw, dp, fv) + '] ' + syminfo.ticker + ' (' + timeframe.period + ') zone ' + str.tostring(low[mo], format.mintick) + ' - ' + str.tostring(high[mo], format.mintick), alert.freq_once_per_bar_close)
+    loP := na
+
+// ================= MITIGATION =================
+f_manage(array<box> arr, bool isBull) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            b = array.get(arr, i)
+            float src = mitMode == 'Wick' ? (isBull ? low : high) : close
+            bool broken = isBull ? src < box.get_bottom(b) : src > box.get_top(b)
+            if broken
+                if showMit
+                    box.set_right(b, bar_index)
+                    box.set_bgcolor(b, color.new(color.gray, 90))
+                    box.set_border_color(b, color.new(color.gray, 70))
+                    box.set_text_color(b, color.new(color.gray, 40))
+                else
+                    box.delete(b)
+                array.remove(arr, i)
+                continue
+            box.set_right(b, bar_index)
+
+f_manage(obBull, true)
+f_manage(obBear, false)
